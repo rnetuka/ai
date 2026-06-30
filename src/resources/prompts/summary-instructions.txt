@@ -1,0 +1,10 @@
+Read the following text:
+Text: {search_result_text}
+
+-----
+
+Using the above text, answer in short the following question.
+Question: {search_query}
+
+If you cannot answer the question above using the text provided above, then just summarize the text. Include all factual
+information, numbers, stats etc. if available.
