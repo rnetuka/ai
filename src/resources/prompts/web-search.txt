@@ -1,5 +1,5 @@
 {assistant_instructions}
 
-Write exactly {num_search_queries} web search queries to gather as much information as possible on the following question:
+Write {num_search_queries} web search queries to gather as much information as possible on the following question:
 {user_question}. Your objective is to write a report based on the information you find. Respond with writing only the
 queries without any markup. Each query must be a separate line.

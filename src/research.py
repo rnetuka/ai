@@ -1,143 +1,207 @@
 import json
-import requests
-from bs4 import BeautifulSoup
-from typing import List, Any, TypeVar, NamedTuple, overload
-from ddgs import DDGS
+import operator
+
+from typing import TypedDict, Optional, Annotated
 from langchain_core.language_models import BaseChatModel
+from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnableLambda
+from langgraph.graph import StateGraph, END
+from langgraph.types import Send, Command
 from llm import Mistral
+from tools import WebSearchTool, WebScraperTool
 
 
-T = TypeVar('T', bound=dict | list[Any])
+class Search(TypedDict):
+    query: str
+    url: str
 
 
-def parse(string: str, expected_type: type[T]) -> T:
-    try:
-        if string.startswith('```json') and string.endswith('```'):
-            string = string.replace('```json', '').replace('```', '')
-        return json.loads(string)
-    except Exception:
-        return {}
+class ResearchState(TypedDict):
+    user_question: str
+    assistant_type: str
+    assistant_instructions: str
+    search_queries: list[str]
+    search_urls: list[Search]
+    summaries: Annotated[list[str], operator.add]
+    research_report: str
 
 
-Assistant = NamedTuple('Assistant', [('type', str), ('instructions', str)])
-SearchResult = NamedTuple('SearchResult', [('query', str), ('url', str), ('text', str)])
-Summary = NamedTuple('Summary', [('text', str), ('url', str)])
+class PipelineWorkerState(TypedDict):
+    search_query: str
+    search_url: str
+    search_result_text: Optional[str]
+    summary_text: Optional[str]
 
 
-class WebSearchTool:
-
-    max_results: int
-
-    def __init__(self):
-        self.max_results = 3
-
-    def links(self, query: str) -> list[str]:
-        results = DDGS().text(query, max_results=self.max_results)
-        return [page['href'] for page in results]
+SELECT_ASSISTANT = 'select_assistant'
+GENERATE_QUERIES = 'generate_queries'
+GENERATE_URLS = 'generate_urls'
+PIPELINE_WORKER = 'pipeline_worker'
+WEB_SCRAPE = 'web_scrape'
+SUMMARIZE_SEARCH_RESULT = 'summarize_search_result'
+REDUCE_SUMMARIES = 'reduce_summaries'
+WRITE_RESEARCH_REPORT = 'write_research_report'
 
 
-class WebScraperTool:
-
-    def scrape(self, url: str) -> str:
-        headers = {
-            'User-Agent': 'Chrome/124.0.0.0',
-            'Accept-Language': 'en-Us, en'
-        }
-        response = requests.get(url, headers=headers, timeout=15)
-        if response.ok:
-            soup = BeautifulSoup(response.text, 'html.parser')
-            return soup.get_text(separator=' ', strip=True)
-        else:
-            raise Exception(f'Could not retrieve the webpage: {response.status_code}')
-
-
-
-class Research:
+class Worker:
 
     llm: BaseChatModel
 
-    def __init__(self):
-        self.llm = Mistral()
-        self.search_tool = WebSearchTool()
-        self.web_scraper_tool = WebScraperTool()
+    def __init__(self, llm: BaseChatModel):
+        self.llm = llm
 
     def prompt_template(self, name: str) -> PromptTemplate:
         with open(f'resources/prompts/{name}.txt') as file:
             text = file.read()
             return PromptTemplate.from_template(text)
 
-    def select_assistant_prompt(self, question: str) -> str:
-        return self.prompt_template('assistant-selection').format(user_question = question)
+    def parse_dict(self, string: str) -> dict:
+        try:
+            if string.startswith('```json') and string.endswith('```'):
+                string = string.replace('```json', '').replace('```', '')
+            return json.loads(string)
+        except Exception as ex:
+            print(ex)
+            return {}
 
-    def select_assistant(self, question: str) -> Assistant:
-        response = self.llm.invoke(self.select_assistant_prompt(question))
-        assistant = parse(response.content, dict)
-        return Assistant(type = assistant['assistant_type'], instructions = assistant['assistant_instructions'])
 
-    def web_search_prompt(self, assistant: str, question: str) -> str:
-        return self.prompt_template('web-search').format(
-            assistant_instructions = assistant,
-            user_question = question,
-            num_search_queries = 2
+class PipelineWorker(Worker):
+
+    def __init__(self, llm: BaseChatModel):
+        super().__init__(llm)
+        self.web_scraper_tool = WebScraperTool()
+        self.app = self.create_graph()
+
+    def create_graph(self):
+        graph = StateGraph(PipelineWorkerState)
+        graph.add_node(WEB_SCRAPE, self.web_scrape)
+        graph.add_node(SUMMARIZE_SEARCH_RESULT, self.summarize_search_result)
+        graph.add_edge(WEB_SCRAPE, SUMMARIZE_SEARCH_RESULT)
+        graph.add_edge(SUMMARIZE_SEARCH_RESULT, END)
+        graph.set_entry_point(WEB_SCRAPE)
+        return graph.compile()
+
+    def web_scrape(self, state: PipelineWorkerState) -> dict | Command:
+        url = state['search_url']
+        print(f'* Scrapping web page "{url}"')
+        try:
+            text = self.web_scraper_tool.scrape(url)[:10000]
+            return {'search_result_text': text}
+        except:
+            print(f'* Exception during scrapping web page: {url}')
+            return Command(goto=END)
+
+    def summarize_search_result(self, state: PipelineWorkerState) -> dict:
+        chain = (
+            self.prompt_template('summary-instructions')
+            | self.llm
+            | StrOutputParser()
         )
+        print(f'* Summarizing search result: {state["search_result_text"][:50]}...')
+        summary = chain.invoke(state)
+        return {'summary_text': summary}
 
-    def create_search_queries(self, assistant: Assistant, question: str) -> list[str]:
-        prompt = self.web_search_prompt(assistant.instructions, question)
-        response = self.llm.invoke(prompt)
-        queries = response.content.split('\n')
-        return queries
+    def invoke(self, state: PipelineWorkerState) -> PipelineWorkerState:
+        return self.app.invoke(state)
 
-    def search(self, query: str) -> list[SearchResult]:
-        results = []
-        for url in self.search_tool.links(query):
-            try:
-                result = self.web_scraper_tool.scrape(url)[:10000]
-                results.append(SearchResult(query, url, result))
-            except Exception as ex:
-                print(f'Exception during web scraping: {ex}')
-        return results
 
-    def summary_prompt(self, text: str, question: str) -> str:
-        return self.prompt_template('summary-instructions').format(search_result_text=text, search_query=question)
+class ResearchAgent(Worker):
 
-    def summarize(self, text: str, question: str) -> str:
-        prompt = self.summary_prompt(text, question)
-        response = self.llm.invoke(prompt)
-        return response.content
+    def __init__(self, llm: BaseChatModel):
+        super().__init__(llm)
+        self.search_queries_count = 2
+        self.search_tool = WebSearchTool(max_results=2)
+        self.pipeline_worker = PipelineWorker(llm)
+        self.app = self.create_graph()
 
-    def summarize_result(self, search_result: SearchResult) -> Summary:
-        text = self.summarize(search_result.text, search_result.query)
-        return Summary(text, search_result.url)
+    def create_graph(self):
+        graph = StateGraph(ResearchState)
+        graph.set_entry_point(SELECT_ASSISTANT)
+        # nodes
+        graph.add_node(SELECT_ASSISTANT, self.select_assistant)
+        graph.add_node(GENERATE_QUERIES, self.generate_search_queries)
+        graph.add_node(GENERATE_URLS, self.generate_search_urls)
+        graph.add_node(PIPELINE_WORKER, self.call_pipeline_worker)
+        graph.add_node(WRITE_RESEARCH_REPORT, self.write_research_report)
+        # edges
+        graph.add_edge(SELECT_ASSISTANT, GENERATE_QUERIES)
+        graph.add_edge(GENERATE_QUERIES, GENERATE_URLS)
+        graph.add_conditional_edges(GENERATE_URLS,self.split_pipeline_work,[PIPELINE_WORKER])
+        graph.add_edge(PIPELINE_WORKER, WRITE_RESEARCH_REPORT)
+        graph.add_edge(WRITE_RESEARCH_REPORT, END)
+        return graph.compile()
 
-    def research_report_prompt(self, question: str, summaries: str) -> str:
-        return self.prompt_template('research-report').format(
-            research_summary=summaries,
-            user_question=question
+    def select_assistant(self, state: ResearchState) -> dict:
+        chain = (
+            self.prompt_template('assistant-selection')
+            | self.llm
+            | StrOutputParser()
+            | self.parse_dict
         )
+        assistant_info = chain.invoke(state)
+        print(f'* Selected assistant: {assistant_info["assistant_type"]}')
+        return {
+            'assistant_type': assistant_info['assistant_type'],
+            'assistant_instructions': assistant_info['assistant_instructions']
+        }
 
-    def write_report(self, question: str, summaries: list[Summary]) -> str:
-        prompt = self.research_report_prompt(
-            question=question,
-            summaries='\n'.join(f'Source URL: {summary.url}\nSummary: {summary.text}' for summary in summaries)
+    def generate_search_queries(self, state: ResearchState) -> dict:
+        chain = (
+            RunnableLambda(lambda x: x | {'num_search_queries': self.search_queries_count})
+            | self.prompt_template('web-search')
+            | self.llm
+            | StrOutputParser()
+            | RunnableLambda(lambda result_text: result_text.split('\n'))
         )
-        research_report = self.llm.invoke(prompt)
-        return research_report.content
+        search_queries = [query for query in chain.invoke(state) if query.strip()]
+        for query in search_queries:
+            print(f'* Generated query: {query}')
+        return {'search_queries': search_queries}
 
-    def process(self, question: str) -> str:
-        assistant = self.select_assistant(question)
-        print(f'Selected assistant: {assistant.type}')
-        print('---')
-        queries = self.create_search_queries(assistant, question)
-        print('\n'.join(f'Query {i + 1}: {query}' for i, query in enumerate(queries)))
-        print('---')
-        results = [result for query in queries for result in self.search(query)]
-        summaries = [self.summarize_result(result) for result in results]
-        return self.write_report(question, summaries)
+    def generate_search_urls(self, state: ResearchState) -> dict:
+        queries = state['search_queries']
+        searches = []
+        for query in queries:
+            for url in self.search_tool.links(query):
+                searches.append({'query': query, 'url': url})
+        return {'search_urls': searches}
+
+    def split_pipeline_work(self, state: ResearchState) -> list[Send]:
+        searches = state['search_urls']
+        return [Send(PIPELINE_WORKER, {'search_query': search['query'], 'search_url': search['url']}) for search in searches]
+
+    def call_pipeline_worker(self, state: PipelineWorkerState) -> dict:
+        result = self.pipeline_worker.invoke(state)
+        if 'summary_text' not in result:
+            return {'summaries': []}
+        source_url = result['search_url']
+        summary_text = result['summary_text']
+        return {'summaries': [f'Source URL: {source_url}\nSummary: {summary_text}']}
+
+    def write_research_report(self, state: ResearchState) -> dict:
+        user_question = state['user_question']
+        summaries = '\n'.join(state['summaries'])
+        chain =(
+            RunnableLambda(lambda x: {
+                'research_summary': summaries,
+                'user_question': user_question,
+            })
+            | self.prompt_template('research-report')
+            | self.llm
+            | StrOutputParser()
+        )
+        report = chain.invoke(state)
+        return {'research_report': report}
+
+    def process(self, user_question: str) -> str:
+        state = self.app.invoke({'user_question': user_question})
+        return state['research_report']
 
 
 if __name__ == '__main__':
     question = 'Which national parks are in California?'
-    research = Research()
-    answer = research.process(question)
+    llm = Mistral()
+    research_agent = ResearchAgent(llm)
+    answer = research_agent.process(question)
     print(answer)
