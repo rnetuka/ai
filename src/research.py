@@ -5,17 +5,13 @@ from typing import TypedDict, Optional, Annotated, cast
 from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import PromptTemplate
-from langchain_core.runnables import RunnableLambda
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 from langgraph.errors import NodeError
 from langgraph.graph import StateGraph, END
 from langgraph.types import Send, Command
 from llm import Mistral
 from tools import WebSearchTool, WebScraperTool
-
-
-class Assistant(TypedDict):
-    assistant_type: str
-    assistant_instructions: str
+from tools.web_scraper import WebScraperException
 
 
 class Search(TypedDict):
@@ -30,8 +26,9 @@ class ResearchState(TypedDict):
     search_queries: list[str]
     search_urls: list[Search]
     summaries: Annotated[list[str], operator.add]
+    summary_exceptions: Annotated[list[Exception], operator.add]
+    exception: Optional[Exception]
     research_report: str
-    exception: Optional[str]
 
 
 class PipelineWorkerState(TypedDict):
@@ -40,6 +37,12 @@ class PipelineWorkerState(TypedDict):
     search_result_text: Optional[str]
     summary_text: Optional[str]
     exception: Optional[Exception]
+
+
+class ResearchAgentException(Exception):
+
+    def __init__(self, message: str):
+        super().__init__(message)
 
 
 SELECT_ASSISTANT = 'select_assistant'
@@ -98,16 +101,17 @@ class PipelineWorker(Worker):
     def summary_parser(self):
         return StrOutputParser()
 
-    def stop(self, state: PipelineWorkerState, error: NodeError):
-        return Command(update={'exception': error.error}, goto=END)
+    def stop(self, state: PipelineWorkerState, error: NodeError) -> Command:
+        exception = error.error
+        return Command(update={'exception': exception}, goto=END)
 
-    def web_scrape(self, state: PipelineWorkerState) -> dict | Command:
+    def web_scrape(self, state: PipelineWorkerState) -> dict:
         url = state['search_url']
-        print(f'* Scrapping web page "{url}"')
+        print(f'* Scrapping web page "{url}", query: {state["search_query"]}')
         try:
             text = self.web_scraper_tool.scrape(url)[:10000]
             return {'search_result_text': text}
-        except Exception as ex:
+        except WebScraperException as ex:
             print(f'* Exception during scrapping web page: {url}')
             raise ex
 
@@ -160,6 +164,10 @@ class ResearchAgent(Worker):
         return self.prompt_template('web-search')
 
     @property
+    def exception_summary_instructions(self) -> PromptTemplate:
+        return self.prompt_template('exception')
+
+    @property
     def assistant_parser(self):
         return StrOutputParser() | self.parse_dict
 
@@ -167,7 +175,7 @@ class ResearchAgent(Worker):
     def search_queries_parser(self):
         return StrOutputParser() | RunnableLambda(lambda text: [query for query in text.split('\n') if query.strip()])
 
-    def select_assistant(self, state: ResearchState) -> Assistant:
+    def select_assistant(self, state: ResearchState) -> dict:
         assistant_info = (
             self.select_assistant_instructions
             | self.llm
@@ -197,15 +205,15 @@ class ResearchAgent(Worker):
 
     def call_pipeline_worker(self, state: PipelineWorkerState) -> dict:
         result = self.pipeline_worker.invoke(state)
-        if 'summary_text' not in result:
-            return {'summaries': []}
+        if 'exception' in result:
+            return {'summary_exceptions': [result['exception']]}
         source_url = result['search_url']
         summary_text = result['summary_text']
         return {'summaries': [f'Source URL: {source_url}\nSummary: {summary_text}']}
 
     def write_research_report(self, state: ResearchState) -> dict:
         if len(state['summaries']) == 0:
-            raise Exception('No summaries provided')
+            raise ResearchAgentException('No summaries has been provided')
         summaries = '\n'.join(state['summaries'])
         report = (
             RunnableLambda(lambda x: x | {'research_summary': summaries})
@@ -215,9 +223,16 @@ class ResearchAgent(Worker):
         ).invoke(state)
         return {'research_report': report}
 
-    def handle_research_exception(self, exception):
+    def handle_research_exception(self, state: ResearchState, error: NodeError):
+        exceptions = [error.error] + state['summary_exceptions']
+        exceptions = '\n'.join(str(ex) for ex in exceptions)
+        exception_summary = (
+            self.exception_summary_instructions
+            | self.llm
+            | StrOutputParser()
+        ).invoke({'exceptions': exceptions})
         return Command(
-            update={'exception': "I wasn't able to write the research. No summaries were provided by pipeline workers"},
+            update={'exception': exception_summary},
             goto=END
         )
 

@@ -1,0 +1,5 @@
+There was an exception during runtime. Read following exceptions and explain the user what went wrong.
+Use 30 words at maximum.
+
+Exceptions:
+{exceptions}

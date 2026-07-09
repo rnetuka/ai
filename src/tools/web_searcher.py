@@ -10,4 +10,4 @@ class WebSearchTool:
 
     def links(self, query: str) -> list[str]:
         results = DDGS().text(query, max_results=self.max_results)
-        return [page['href'] for page in results]
+        return [page['href'] for page in results if page['href'] is not None]
