@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 class WebScraperTool:
 
     def scrape(self, url: str) -> str:
+        raise Exception('Mock exception')
         headers = {
             'User-Agent': 'Chrome/124.0.0.0',
             'Accept-Language': 'en-Us, en'
