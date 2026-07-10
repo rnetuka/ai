@@ -1,17 +1,26 @@
 import json
+import logging
 import operator
 
 from typing import TypedDict, Optional, Annotated, cast
-from langchain_core.language_models import BaseChatModel
+from langchain_core.language_models import BaseChatModel, LanguageModelOutput
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import PromptTemplate
-from langchain_core.runnables import RunnableLambda, RunnablePassthrough
+from langchain_core.runnables import RunnableLambda, Runnable
 from langgraph.errors import NodeError
 from langgraph.graph import StateGraph, END
 from langgraph.types import Send, Command
 from llm import Mistral
 from tools import WebSearchTool, WebScraperTool
 from tools.web_scraper import WebScraperException
+
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+console_handler = logging.StreamHandler()
+formatter = logging.Formatter('[%(levelname)s] %(message)s')
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
 
 
 class Search(TypedDict):
@@ -37,12 +46,6 @@ class PipelineWorkerState(TypedDict):
     search_result_text: Optional[str]
     summary_text: Optional[str]
     exception: Optional[Exception]
-
-
-class ResearchAgentException(Exception):
-
-    def __init__(self, message: str):
-        super().__init__(message)
 
 
 SELECT_ASSISTANT = 'select_assistant'
@@ -98,35 +101,38 @@ class PipelineWorker(Worker):
         return self.prompt_template('summary-instructions')
 
     @property
-    def summary_parser(self):
+    def summary_parser(self) -> Runnable[LanguageModelOutput, str]:
         return StrOutputParser()
 
-    def stop(self, state: PipelineWorkerState, error: NodeError) -> Command:
+    def stop(self, _: PipelineWorkerState, error: NodeError) -> Command:
         exception = error.error
         return Command(update={'exception': exception}, goto=END)
 
     def web_scrape(self, state: PipelineWorkerState) -> dict:
         url = state['search_url']
-        print(f'* Scrapping web page "{url}", query: {state["search_query"]}')
         try:
+            logger.info(f'Scrapping web page {url}')
             text = self.web_scraper_tool.scrape(url)[:10000]
             return {'search_result_text': text}
         except WebScraperException as ex:
-            print(f'* Exception during scrapping web page: {url}')
+            logger.error(f'Exception during scrapping web page: {url}')
             raise ex
 
     def summarize_search_result(self, state: PipelineWorkerState) -> dict:
-        print(f'* Summarizing search result: {state["search_result_text"][:50]}... for query: {state["search_query"]}')
-        summary = (
-            self.summary_instructions
-            | self.llm
-            | self.summary_parser
-        ).invoke(state)
+        logger.info(f'Summarizing search result: {state["search_result_text"][:50]}... for query: {state["search_query"]}')
+        chain = self.summary_instructions | self.llm | self.summary_parser
+        summary = chain.invoke(state)
         return {'summary_text': summary}
 
     def invoke(self, state: PipelineWorkerState) -> PipelineWorkerState:
         result = self.app.invoke(state)
+        if 'exception' in result:
+            raise PipelineWorkerException() from result['exception']
+
         return cast(PipelineWorkerState, result)
+
+
+class PipelineWorkerException(Exception): pass
 
 
 class ResearchAgent(Worker):
@@ -164,7 +170,11 @@ class ResearchAgent(Worker):
         return self.prompt_template('web-search')
 
     @property
-    def exception_summary_instructions(self) -> PromptTemplate:
+    def research_report_instructions(self) -> PromptTemplate:
+        return self.prompt_template('research-report')
+
+    @property
+    def exception_description_instructions(self) -> PromptTemplate:
         return self.prompt_template('exception')
 
     @property
@@ -176,22 +186,18 @@ class ResearchAgent(Worker):
         return StrOutputParser() | RunnableLambda(lambda text: [query for query in text.split('\n') if query.strip()])
 
     def select_assistant(self, state: ResearchState) -> dict:
-        assistant_info = (
-            self.select_assistant_instructions
-            | self.llm
-            | self.assistant_parser
-        ).invoke(state)
-        print(f'* Selected assistant: {assistant_info["assistant_type"]}')
+        chain = self.select_assistant_instructions | self.llm | self.assistant_parser
+        assistant_info = chain.invoke(state)
+        logger.info(f'Selected assistant: {assistant_info["assistant_type"]}')
         return assistant_info
 
     def generate_search_queries(self, state: ResearchState) -> dict:
-        search_queries = (
-            RunnableLambda(lambda x: x | {'num_search_queries': self.search_queries_count})
-            | self.web_search_instructions
-            | self.llm
-            | self.search_queries_parser
-        ).invoke(state)
-        print('\n'.join([f'* Generated query: {query}' for query in search_queries]))
+        chain = self.web_search_instructions | self.llm | self.search_queries_parser
+        search_queries = chain.invoke(state | {'num_search_queries': self.search_queries_count})
+
+        for query in search_queries:
+            logger.info(f'Generated query: {query}')
+
         return {'search_queries': search_queries}
 
     def generate_search_urls(self, state: ResearchState) -> dict:
@@ -204,41 +210,42 @@ class ResearchAgent(Worker):
         return [Send(PIPELINE_WORKER, {'search_query': search['query'], 'search_url': search['url']}) for search in searches]
 
     def call_pipeline_worker(self, state: PipelineWorkerState) -> dict:
-        result = self.pipeline_worker.invoke(state)
-        if 'exception' in result:
-            return {'summary_exceptions': [result['exception']]}
-        source_url = result['search_url']
-        summary_text = result['summary_text']
-        return {'summaries': [f'Source URL: {source_url}\nSummary: {summary_text}']}
+        try:
+            result = self.pipeline_worker.invoke(state)
+            source_url = result['search_url']
+            summary_text = result['summary_text']
+            summary = f'Source URL: {source_url}\nSummary: {summary_text}'
+            return {'summaries': [summary]}
+        except PipelineWorkerException as ex:
+            return {'summary_exceptions': [ex]}
 
     def write_research_report(self, state: ResearchState) -> dict:
-        if len(state['summaries']) == 0:
+        summaries = state['summaries']
+
+        if len(summaries) == 0:
             raise ResearchAgentException('No summaries has been provided')
-        summaries = '\n'.join(state['summaries'])
-        report = (
-            RunnableLambda(lambda x: x | {'research_summary': summaries})
-            | self.prompt_template('research-report')
-            | self.llm
-            | StrOutputParser()
-        ).invoke(state)
+
+        summaries = '\n'.join(summaries)
+        chain = self.research_report_instructions | self.llm | StrOutputParser()
+        report = chain.invoke(state | {'research_summary': summaries})
         return {'research_report': report}
 
-    def handle_research_exception(self, state: ResearchState, error: NodeError):
+    def handle_research_exception(self, state: ResearchState, error: NodeError) -> Command:
         exceptions = [error.error] + state['summary_exceptions']
         exceptions = '\n'.join(str(ex) for ex in exceptions)
-        exception_summary = (
-            self.exception_summary_instructions
-            | self.llm
-            | StrOutputParser()
-        ).invoke({'exceptions': exceptions})
+        chain = self.exception_description_instructions | self.llm | StrOutputParser()
+        description = chain.invoke({'exceptions': exceptions})
         return Command(
-            update={'exception': exception_summary},
+            update={'exception': description},
             goto=END
         )
 
     def process(self, user_question: str) -> str:
         state = self.app.invoke({'user_question': user_question})
         return state['exception'] if 'exception' in state else state['research_report']
+
+
+class ResearchAgentException(Exception): pass
 
 
 if __name__ == '__main__':
