@@ -1,12 +1,11 @@
-import json
 import logging
 import operator
 
 from typing import TypedDict, Optional, Annotated, cast
-from langchain_core.language_models import BaseChatModel, LanguageModelOutput
-from langchain_core.output_parsers import StrOutputParser
+from langchain_core.language_models import BaseChatModel
+from langchain_core.output_parsers import StrOutputParser, JsonOutputParser, ListOutputParser, NumberedListOutputParser
 from langchain_core.prompts import PromptTemplate
-from langchain_core.runnables import RunnableLambda, Runnable
+from langchain_core.runnables import RunnableLambda
 from langgraph.errors import NodeError
 from langgraph.graph import StateGraph, END
 from langgraph.types import Send, Command
@@ -18,8 +17,7 @@ from tools.web_scraper import WebScraperException
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 console_handler = logging.StreamHandler()
-formatter = logging.Formatter('[%(levelname)s] %(message)s')
-console_handler.setFormatter(formatter)
+console_handler.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
 logger.addHandler(console_handler)
 
 
@@ -58,6 +56,10 @@ REDUCE_SUMMARIES = 'reduce_summaries'
 WRITE_RESEARCH_REPORT = 'write_research_report'
 
 
+class PipelineWorkerException(Exception): pass
+class ResearchAgentException(Exception): pass
+
+
 class Worker:
 
     llm: BaseChatModel
@@ -70,15 +72,6 @@ class Worker:
             text = file.read()
             return PromptTemplate.from_template(text)
 
-    def parse_dict(self, string: str) -> dict:
-        try:
-            if string.startswith('```json') and string.endswith('```'):
-                string = string.replace('```json', '').replace('```', '')
-            return json.loads(string)
-        except Exception as ex:
-            print(ex)
-            return {}
-
 
 class PipelineWorker(Worker):
 
@@ -89,7 +82,7 @@ class PipelineWorker(Worker):
 
     def create_graph(self):
         graph = StateGraph(PipelineWorkerState)
-        graph.add_node(WEB_SCRAPE, self.web_scrape, error_handler=self.stop)
+        graph.add_node(WEB_SCRAPE, self.web_scrape, error_handler=self.handle_web_scrape_exception)
         graph.add_node(SUMMARIZE_SEARCH_RESULT, self.summarize_search_result)
         graph.add_edge(WEB_SCRAPE, SUMMARIZE_SEARCH_RESULT)
         graph.add_edge(SUMMARIZE_SEARCH_RESULT, END)
@@ -99,14 +92,6 @@ class PipelineWorker(Worker):
     @property
     def summary_instructions(self) -> PromptTemplate:
         return self.prompt_template('summary-instructions')
-
-    @property
-    def summary_parser(self) -> Runnable[LanguageModelOutput, str]:
-        return StrOutputParser()
-
-    def stop(self, _: PipelineWorkerState, error: NodeError) -> Command:
-        exception = error.error
-        return Command(update={'exception': exception}, goto=END)
 
     def web_scrape(self, state: PipelineWorkerState) -> dict:
         url = state['search_url']
@@ -118,9 +103,12 @@ class PipelineWorker(Worker):
             logger.error(f'Exception during scrapping web page: {url}')
             raise ex
 
+    def handle_web_scrape_exception(self, _: PipelineWorkerState, error: NodeError) -> Command:
+        return Command(update={'exception': error.error}, goto=END)
+
     def summarize_search_result(self, state: PipelineWorkerState) -> dict:
         logger.info(f'Summarizing search result: {state["search_result_text"][:50]}... for query: {state["search_query"]}')
-        chain = self.summary_instructions | self.llm | self.summary_parser
+        chain = self.summary_instructions | self.llm | StrOutputParser()
         summary = chain.invoke(state)
         return {'summary_text': summary}
 
@@ -132,7 +120,7 @@ class PipelineWorker(Worker):
         return cast(PipelineWorkerState, result)
 
 
-class PipelineWorkerException(Exception): pass
+
 
 
 class ResearchAgent(Worker):
@@ -177,22 +165,14 @@ class ResearchAgent(Worker):
     def exception_description_instructions(self) -> PromptTemplate:
         return self.prompt_template('exception')
 
-    @property
-    def assistant_parser(self):
-        return StrOutputParser() | self.parse_dict
-
-    @property
-    def search_queries_parser(self):
-        return StrOutputParser() | RunnableLambda(lambda text: [query for query in text.split('\n') if query.strip()])
-
     def select_assistant(self, state: ResearchState) -> dict:
-        chain = self.select_assistant_instructions | self.llm | self.assistant_parser
+        chain = self.select_assistant_instructions | self.llm | JsonOutputParser()
         assistant_info = chain.invoke(state)
         logger.info(f'Selected assistant: {assistant_info["assistant_type"]}')
         return assistant_info
 
     def generate_search_queries(self, state: ResearchState) -> dict:
-        chain = self.web_search_instructions | self.llm | self.search_queries_parser
+        chain = self.web_search_instructions | self.llm | NumberedListOutputParser()
         search_queries = chain.invoke(state | {'num_search_queries': self.search_queries_count})
 
         for query in search_queries:
@@ -243,9 +223,6 @@ class ResearchAgent(Worker):
     def process(self, user_question: str) -> str:
         state = self.app.invoke({'user_question': user_question})
         return state['exception'] if 'exception' in state else state['research_report']
-
-
-class ResearchAgentException(Exception): pass
 
 
 if __name__ == '__main__':
